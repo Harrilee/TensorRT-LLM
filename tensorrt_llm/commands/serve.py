@@ -12,6 +12,7 @@ from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 import click
 import torch
 import yaml
+from pydantic import ValidationError
 from strenum import StrEnum
 from torch.cuda import device_count
 
@@ -38,6 +39,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.commands.ai_config_helper import handle_validation_error
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
@@ -831,9 +833,11 @@ def serve(
             video_pruning_rate=video_pruning_rate)
 
         llm_args_extra_dict = {}
+        config_file_contents = None
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
+                config_file_contents = f.read()
+            llm_args_extra_dict = yaml.safe_load(config_file_contents) or {}
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
@@ -917,10 +921,45 @@ def serve(
         launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
-    if get_is_diffusion_model(model):
-        _serve_visual_gen()
-    else:
-        _serve_llm()
+    while True:
+        try:
+            if get_is_diffusion_model(model):
+                _serve_visual_gen()
+            else:
+                _serve_llm()
+            break
+        except (ValidationError, ValueError) as exc:
+            cli_args = {
+                "model": model,
+                "backend": backend,
+                "tensor_parallel_size": tensor_parallel_size,
+                "pipeline_parallel_size": pipeline_parallel_size,
+                "context_parallel_size": context_parallel_size,
+                "max_batch_size": max_batch_size,
+                "max_num_tokens": max_num_tokens,
+                "max_seq_len": max_seq_len,
+                "max_beam_width": max_beam_width,
+                "free_gpu_memory_fraction": free_gpu_memory_fraction,
+                "kv_cache_dtype": kv_cache_dtype,
+                "extra_llm_api_options": extra_llm_api_options,
+            }
+            config_contents = None
+            config_path = extra_llm_api_options or extra_visual_gen_options
+            if config_path:
+                try:
+                    with open(config_path, 'r') as f:
+                        config_contents = f.read()
+                except OSError:
+                    pass
+            should_retry = handle_validation_error(
+                exc,
+                cli_args=cli_args,
+                config_file_path=config_path,
+                config_file_contents=config_contents,
+                backend=backend,
+            )
+            if not should_retry:
+                sys.exit(1)
 
 
 @click.command("mm_embedding_serve")
