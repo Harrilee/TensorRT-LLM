@@ -8,6 +8,8 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import is_sm_100f, local_mpi_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather, reducescatter
@@ -484,9 +486,20 @@ class WideEPMoE(MoE):
                         gathered_loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not use_postquant_alltoall:
-                    x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
-                        self.deep_ep_buffer.dispatch(x, token_selected_slots, token_final_scales, self.num_slots,
-                        self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
+                    _tracer = get_moe_trace_logger()
+                    _pb_tensors = [x, token_selected_slots, token_final_scales]
+                    _pb = sum(t.numel() * t.element_size() for t in _pb_tensors if t is not None)
+                    with _tracer.time_a2a(
+                        op_type="dispatch",
+                        layer=self.layer_idx if self.layer_idx is not None else -1,
+                        phase=current_phase(),
+                        payload_bytes=_pb,
+                        backend="deepep",
+                    ) as _span:
+                        _span.to_rank = self.ep_size
+                        x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
+                            self.deep_ep_buffer.dispatch(x, token_selected_slots, token_final_scales, self.num_slots,
+                            self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                     padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
@@ -494,8 +507,19 @@ class WideEPMoE(MoE):
                     deep_ep_topk_idx = token_selected_slots
                     deep_ep_topk_weights = token_final_scales
                     assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                    x, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    _tracer = get_moe_trace_logger()
+                    _pb_tensors = [x, deep_ep_topk_idx]
+                    _pb = sum(t.numel() * t.element_size() for t in _pb_tensors if t is not None)
+                    with _tracer.time_a2a(
+                        op_type="dispatch",
+                        layer=self.layer_idx if self.layer_idx is not None else -1,
+                        phase=current_phase(),
+                        payload_bytes=_pb,
+                        backend="deepep_ll",
+                    ) as _span:
+                        _span.to_rank = self.ep_size
+                        x, recv_expert_count, deep_ep_handle = \
+                            self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
                     x, _, token_selected_slots, token_final_scales = self.deep_ep_low_latency_dispatch_modify_output_to_adapt_fused_moe(
                         x, None, recv_expert_count, token_final_scales.dtype)
 
@@ -570,9 +594,20 @@ class WideEPMoE(MoE):
                     # TODO: remove the adapter by adding dtype support to DeepEP
                     x_sf_dtype = x_sf.dtype
                     x_sf = x_sf.view(torch.float32)
-                (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
-                    self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots, token_final_scales, self.num_slots,
-                    self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
+                _tracer = get_moe_trace_logger()
+                _pb_tensors = [x, x_sf, token_selected_slots, token_final_scales]
+                _pb = sum(t.numel() * t.element_size() for t in _pb_tensors if t is not None)
+                with _tracer.time_a2a(
+                    op_type="dispatch",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="deepep",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
+                        self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots, token_final_scales, self.num_slots,
+                        self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                 padded, x, x_sf, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
@@ -582,42 +617,53 @@ class WideEPMoE(MoE):
                 assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
                 deep_ep_topk_idx = token_selected_slots
                 deep_ep_topk_weights = token_final_scales
-                if self.has_fp8_qdq:
-                    assert x.dtype == torch.float8_e4m3fn and x_sf is None, "x should be torch.float8_e4m3fn and x_sf should be None in fp8 postquant alltoall"
-                    x = x.view(torch.bfloat16)
-                    x, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                    x = x.view(torch.float8_e4m3fn)
-                elif self.has_nvfp4:
-                    token_num = x_row
-                    hidden_size = x_col
-                    assert x.dtype == torch.uint8 and x_sf is not None and x_sf.dtype == torch.uint8
-                    assert hidden_size % 32 == 0, "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
-                    assert x_sf.shape[0] == token_num and x_sf.shape[
-                        1] == hidden_size // 16
-                    assert x.shape[0] == token_num and x.shape[
-                        1] == hidden_size // 2
+                _tracer = get_moe_trace_logger()
+                _pb_tensors = [x, x_sf, deep_ep_topk_idx]
+                _pb = sum(t.numel() * t.element_size() for t in _pb_tensors if t is not None)
+                with _tracer.time_a2a(
+                    op_type="dispatch",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="deepep_ll",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    if self.has_fp8_qdq:
+                        assert x.dtype == torch.float8_e4m3fn and x_sf is None, "x should be torch.float8_e4m3fn and x_sf should be None in fp8 postquant alltoall"
+                        x = x.view(torch.bfloat16)
+                        x, recv_expert_count, deep_ep_handle = \
+                            self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                        x = x.view(torch.float8_e4m3fn)
+                    elif self.has_nvfp4:
+                        token_num = x_row
+                        hidden_size = x_col
+                        assert x.dtype == torch.uint8 and x_sf is not None and x_sf.dtype == torch.uint8
+                        assert hidden_size % 32 == 0, "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
+                        assert x_sf.shape[0] == token_num and x_sf.shape[
+                            1] == hidden_size // 16
+                        assert x.shape[0] == token_num and x.shape[
+                            1] == hidden_size // 2
 
-                    x, x_sf, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                    assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
-                    assert x.dim() == 3 and x_sf.dim() == 3
-                    assert x.shape[2] == hidden_size // 2 and x_sf.shape[
-                        2] == hidden_size // 16
-                elif self.has_w4afp8:
-                    assert isinstance(quant_scales, FusedMoEQuantScalesW4A8)
-                    pre_quant_scales = quant_scales.pre_quant_scale_1
-                    assert pre_quant_scales.shape == (
-                        1, x.shape[1]) and pre_quant_scales.dtype == x.dtype
-                    x = (x * pre_quant_scales).to(torch.float8_e4m3fn).view(
-                        torch.bfloat16)
-                    x, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                    x = x.view(torch.float8_e4m3fn)
-                else:
-                    raise ValueError(
-                        f"unsupported quantization mode in postquant alltoall: {self.quant_config.quant_mode}"
-                    )
+                        x, x_sf, recv_expert_count, deep_ep_handle = \
+                            self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                        assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
+                        assert x.dim() == 3 and x_sf.dim() == 3
+                        assert x.shape[2] == hidden_size // 2 and x_sf.shape[
+                            2] == hidden_size // 16
+                    elif self.has_w4afp8:
+                        assert isinstance(quant_scales, FusedMoEQuantScalesW4A8)
+                        pre_quant_scales = quant_scales.pre_quant_scale_1
+                        assert pre_quant_scales.shape == (
+                            1, x.shape[1]) and pre_quant_scales.dtype == x.dtype
+                        x = (x * pre_quant_scales).to(torch.float8_e4m3fn).view(
+                            torch.bfloat16)
+                        x, recv_expert_count, deep_ep_handle = \
+                            self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                        x = x.view(torch.float8_e4m3fn)
+                    else:
+                        raise ValueError(
+                            f"unsupported quantization mode in postquant alltoall: {self.quant_config.quant_mode}"
+                        )
                 x, x_sf, token_selected_slots, token_final_scales = self.deep_ep_low_latency_dispatch_modify_output_to_adapt_fused_moe(
                     x, x_sf, recv_expert_count, token_final_scales.dtype)
             else:
@@ -625,25 +671,36 @@ class WideEPMoE(MoE):
                     f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        final_hidden_states = self.moe_op_impl.run_moe(
-            self,
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            None,  # w3_w1_bias
-            w2_weight.view(weight_dtype),
-            None,  # w2_bias
-            output_dtype,
-            quant_scales=quant_scales,
-            use_all_to_all=use_all_to_all,
-            input_sf=x_sf,
-            swizzled_input_sf=False,
-            min_latency_mode=False,
-            use_fused_finalize=self.use_fused_finalize,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-        )
+        _tracer = get_moe_trace_logger()
+        with _tracer.time_moe_compute(
+            kernel="wide_ep_run_moe",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            extra={
+                "num_tokens": int(x.shape[0]),
+                "num_experts": int(self.num_slots),
+                "backend": "wide_ep",
+            },
+        ):
+            final_hidden_states = self.moe_op_impl.run_moe(
+                self,
+                x,
+                token_selected_slots,
+                token_final_scales,
+                w3_w1_weight.view(weight_dtype),
+                None,  # w3_w1_bias
+                w2_weight.view(weight_dtype),
+                None,  # w2_bias
+                output_dtype,
+                quant_scales=quant_scales,
+                use_all_to_all=use_all_to_all,
+                input_sf=x_sf,
+                swizzled_input_sf=False,
+                min_latency_mode=False,
+                use_fused_finalize=self.use_fused_finalize,
+                tuner_num_tokens=tuner_num_tokens,
+                tuner_top_k=tuner_top_k,
+            )
 
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
@@ -661,27 +718,47 @@ class WideEPMoE(MoE):
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 final_hidden_states = self.unpad_tensors(
                     padded, final_hidden_states)
-                final_hidden_states = self.deep_ep_buffer.combine(
-                    final_hidden_states, deep_ep_handle)
+                _tracer = get_moe_trace_logger()
+                _pb = final_hidden_states.numel() * final_hidden_states.element_size()
+                with _tracer.time_a2a(
+                    op_type="combine",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="deepep",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    final_hidden_states = self.deep_ep_buffer.combine(
+                        final_hidden_states, deep_ep_handle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 num_tokens_per_expert_for_fused_moe = self.mapping.moe_ep_size * all_rank_max_num_tokens
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                if self.is_low_precision_combine_supported():
-                    precision = "fp8"
-                    global_scales = None
-                    if self.has_nvfp4:
-                        precision = "nvfp4"
-                        global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
-                            final_hidden_states, recv_expert_count)
-                    final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
-                        precision, final_hidden_states, global_scales,
-                        deep_ep_topk_idx, deep_ep_topk_weights, deep_ep_handle)
-                else:
-                    final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                        final_hidden_states, deep_ep_topk_idx,
-                        deep_ep_topk_weights, deep_ep_handle)
+                _tracer = get_moe_trace_logger()
+                _pb = final_hidden_states.numel() * final_hidden_states.element_size()
+                with _tracer.time_a2a(
+                    op_type="combine",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="deepep_ll",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    if self.is_low_precision_combine_supported():
+                        precision = "fp8"
+                        global_scales = None
+                        if self.has_nvfp4:
+                            precision = "nvfp4"
+                            global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                                final_hidden_states, recv_expert_count)
+                        final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
+                            precision, final_hidden_states, global_scales,
+                            deep_ep_topk_idx, deep_ep_topk_weights, deep_ep_handle)
+                    else:
+                        final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                            final_hidden_states, deep_ep_topk_idx,
+                            deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
                     f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
@@ -864,14 +941,25 @@ class WideEPMoE(MoE):
                           all_rank_max_num_tokens: int, top_k: int,
                           alltoall_info: MoEAlltoallInfo):
 
-        x, x_sf, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
-            [x, x_sf, token_selected_slots, token_final_scales], alltoall_info,
-            self.alltoall_workspace, self.ep_rank, self.ep_size)
+        _tracer = get_moe_trace_logger()
+        _payload_tensors = [x, x_sf, token_selected_slots, token_final_scales]
+        _payload_bytes = sum(t.numel() * t.element_size() for t in _payload_tensors if t is not None)
+        with _tracer.time_a2a(
+            op_type="dispatch",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_two_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            x, x_sf, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                [x, x_sf, token_selected_slots, token_final_scales], alltoall_info,
+                self.alltoall_workspace, self.ep_rank, self.ep_size)
 
-        torch.ops.trtllm.memset_expert_ids(token_selected_slots,
-                                           alltoall_info.recv_rank_count_cumsum,
-                                           all_rank_max_num_tokens, top_k,
-                                           self.num_slots, self.ep_size)
+            torch.ops.trtllm.memset_expert_ids(token_selected_slots,
+                                               alltoall_info.recv_rank_count_cumsum,
+                                               all_rank_max_num_tokens, top_k,
+                                               self.num_slots, self.ep_size)
 
         return x, x_sf, token_selected_slots, token_final_scales
 
@@ -881,16 +969,27 @@ class WideEPMoE(MoE):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
-        final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-            final_hidden_states,
-            alltoall_info,
-            self.alltoall_workspace,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            top_k=top_k,
-            token_count=token_count,
-            use_low_precision_combine=self.use_low_precision_combine,
-            do_reduce=alltoall_result_do_sum)
+
+        _tracer = get_moe_trace_logger()
+        _payload_bytes = final_hidden_states.numel() * final_hidden_states.element_size()
+        with _tracer.time_a2a(
+            op_type="combine",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_two_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                final_hidden_states,
+                alltoall_info,
+                self.alltoall_workspace,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=top_k,
+                token_count=token_count,
+                use_low_precision_combine=self.use_low_precision_combine,
+                do_reduce=alltoall_result_do_sum)
 
         return final_hidden_states
 

@@ -26,6 +26,8 @@ from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
@@ -873,22 +875,33 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
-                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
-                    [x, x_sf, token_selected_experts, token_final_scales],
-                    alltoall_info,
-                    self.alltoall_workspace,
-                    self.ep_rank,
-                    self.ep_size,
-                )
+                _tracer = get_moe_trace_logger()
+                _pb_tensors = [x, x_sf, token_selected_experts, token_final_scales]
+                _pb = sum(t.numel() * t.element_size() for t in _pb_tensors if t is not None)
+                with _tracer.time_a2a(
+                    op_type="dispatch",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="nvlink_two_sided",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                        [x, x_sf, token_selected_experts, token_final_scales],
+                        alltoall_info,
+                        self.alltoall_workspace,
+                        self.ep_rank,
+                        self.ep_size,
+                    )
 
-                torch.ops.trtllm.memset_expert_ids(
-                    token_selected_experts,
-                    alltoall_info.recv_rank_count_cumsum,
-                    runtime_max_tokens_per_rank,
-                    top_k,
-                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
-                    self.ep_size,
-                )
+                    torch.ops.trtllm.memset_expert_ids(
+                        token_selected_experts,
+                        alltoall_info.recv_rank_count_cumsum,
+                        runtime_max_tokens_per_rank,
+                        top_k,
+                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                        self.ep_size,
+                    )
 
                 if token_final_scales is not None:
                     token_final_scales = token_final_scales.to(torch.bfloat16)
@@ -907,28 +920,38 @@ class TRTLLMGenFusedMoE(MoE):
                 if self.layer_load_balancer and is_last_call:
                     loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
                     )
-                if loadbalancer_local_statistic_info is not None:
-                    recv_tensors = self.moe_a2a.dispatch(
-                        token_selected_experts,
-                        payloads,
-                        runtime_max_tokens_per_rank,
-                        invalid_token_expert_id=
-                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
-                        expert_id_payload_index=expert_id_payload_index,
-                        eplb_local_stats=loadbalancer_local_statistic_info,
-                    )
-                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
-                    self._load_balancer_update_statistic_with_gathered_statistic(
-                        gathered_stats)
-                else:
-                    recv_tensors = self.moe_a2a.dispatch(
-                        token_selected_experts,
-                        payloads,
-                        runtime_max_tokens_per_rank,
-                        invalid_token_expert_id=
-                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
-                        expert_id_payload_index=expert_id_payload_index,
-                    )
+                _tracer = get_moe_trace_logger()
+                _pb = sum(p.numel() * p.element_size() for p in payloads if p is not None)
+                with _tracer.time_a2a(
+                    op_type="dispatch",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="nvlink_one_sided",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    if loadbalancer_local_statistic_info is not None:
+                        recv_tensors = self.moe_a2a.dispatch(
+                            token_selected_experts,
+                            payloads,
+                            runtime_max_tokens_per_rank,
+                            invalid_token_expert_id=
+                            -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                            expert_id_payload_index=expert_id_payload_index,
+                            eplb_local_stats=loadbalancer_local_statistic_info,
+                        )
+                        gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                        self._load_balancer_update_statistic_with_gathered_statistic(
+                            gathered_stats)
+                    else:
+                        recv_tensors = self.moe_a2a.dispatch(
+                            token_selected_experts,
+                            payloads,
+                            runtime_max_tokens_per_rank,
+                            invalid_token_expert_id=
+                            -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                            expert_id_payload_index=expert_id_payload_index,
+                        )
 
                 if x_sf is not None:
                     x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
@@ -974,16 +997,27 @@ class TRTLLMGenFusedMoE(MoE):
         # Determine router_logits based on post_quant_comm
         router_logits_arg = None if post_quant_comm else router_logits
 
-        final_hidden_states = self.run_moe(
-            x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            # TRTLLMGenFusedMoE extra parameters
-            router_logits=router_logits_arg,
-            do_finalize=do_finalize,
-            moe_output=moe_output,
-        )
+        _tracer = get_moe_trace_logger()
+        with _tracer.time_moe_compute(
+            kernel="trtllm_gen_run_moe",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            extra={
+                "num_tokens": int(x.shape[0]) if hasattr(x, "shape") else -1,
+                "num_experts": int(self.num_slots),
+                "backend": "trtllm_gen",
+            },
+        ):
+            final_hidden_states = self.run_moe(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                # TRTLLMGenFusedMoE extra parameters
+                router_logits=router_logits_arg,
+                do_finalize=do_finalize,
+                moe_output=moe_output,
+            )
 
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
@@ -991,38 +1025,58 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if alltoall_info is not None:
-                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-                        final_hidden_states,
-                        alltoall_info,
-                        self.alltoall_workspace,
-                        ep_rank=self.ep_rank,
-                        ep_size=self.ep_size,
-                        top_k=top_k,
-                        use_low_precision_combine=self.
-                        use_low_precision_combine,
-                        token_count=token_count,
-                    )
+                    _tracer = get_moe_trace_logger()
+                    _pb = final_hidden_states.numel() * final_hidden_states.element_size()
+                    with _tracer.time_a2a(
+                        op_type="combine",
+                        layer=self.layer_idx if self.layer_idx is not None else -1,
+                        phase=current_phase(),
+                        payload_bytes=_pb,
+                        backend="nvlink_two_sided",
+                    ) as _span:
+                        _span.to_rank = self.ep_size
+                        final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                            final_hidden_states,
+                            alltoall_info,
+                            self.alltoall_workspace,
+                            ep_rank=self.ep_rank,
+                            ep_size=self.ep_size,
+                            top_k=top_k,
+                            use_low_precision_combine=self.
+                            use_low_precision_combine,
+                            token_count=token_count,
+                        )
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 # If use_workspace_output=True, the MoE result is already in workspace
                 # Otherwise, we need to reshape and pass it
-                if use_workspace_output:
-                    # Workspace payload is returned as 2D [ep_size * max_tokens, hidden]; reshape to 3D.
-                    hidden = final_hidden_states.shape[-1]
-                    payload = moe_output.view(self.ep_size,
-                                              runtime_max_tokens_per_rank,
-                                              hidden)
-                    final_hidden_states = self.moe_a2a.combine(
-                        payload,
-                        runtime_max_tokens_per_rank,
-                        payload_in_workspace=True)
-                else:
-                    hidden = final_hidden_states.shape[-1]
-                    payload = final_hidden_states.view(
-                        self.ep_size, runtime_max_tokens_per_rank, hidden)
-                    final_hidden_states = self.moe_a2a.combine(
-                        payload,
-                        runtime_max_tokens_per_rank,
-                        payload_in_workspace=False)
+                _tracer = get_moe_trace_logger()
+                _pb = final_hidden_states.numel() * final_hidden_states.element_size()
+                with _tracer.time_a2a(
+                    op_type="combine",
+                    layer=self.layer_idx if self.layer_idx is not None else -1,
+                    phase=current_phase(),
+                    payload_bytes=_pb,
+                    backend="nvlink_one_sided",
+                ) as _span:
+                    _span.to_rank = self.ep_size
+                    if use_workspace_output:
+                        # Workspace payload is returned as 2D [ep_size * max_tokens, hidden]; reshape to 3D.
+                        hidden = final_hidden_states.shape[-1]
+                        payload = moe_output.view(self.ep_size,
+                                                  runtime_max_tokens_per_rank,
+                                                  hidden)
+                        final_hidden_states = self.moe_a2a.combine(
+                            payload,
+                            runtime_max_tokens_per_rank,
+                            payload_in_workspace=True)
+                    else:
+                        hidden = final_hidden_states.shape[-1]
+                        payload = final_hidden_states.view(
+                            self.ep_size, runtime_max_tokens_per_rank, hidden)
+                        final_hidden_states = self.moe_a2a.combine(
+                            payload,
+                            runtime_max_tokens_per_rank,
+                            payload_in_workspace=False)
             else:
                 raise ValueError(
                     f"Unsupported moe alltoall method type: {self.alltoall_method_type}"

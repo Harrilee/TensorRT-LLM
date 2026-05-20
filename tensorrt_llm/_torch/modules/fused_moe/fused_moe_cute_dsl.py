@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -731,25 +733,36 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
-        if self.has_nvfp4:
-            return self.run_moe_nvfp4(
-                x=x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                x_sf=x_sf,
-                moe_output=moe_output,
-                enable_alltoall=enable_alltoall)
-        elif self.has_deepseek_fp8_block_scales:
-            return self.run_moe_fp8_block_scales(
-                x=x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                x_sf=x_sf,
-                enable_alltoall=enable_alltoall)
-        else:
-            raise ValueError(
-                f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
-            )
+        _tracer = get_moe_trace_logger()
+        with _tracer.time_moe_compute(
+            kernel="cute_dsl_run_moe",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            extra={
+                "num_tokens": int(x.shape[0]) if hasattr(x, "shape") else -1,
+                "num_experts": int(self.num_slots),
+                "backend": "cute_dsl",
+            },
+        ):
+            if self.has_nvfp4:
+                return self.run_moe_nvfp4(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    moe_output=moe_output,
+                    enable_alltoall=enable_alltoall)
+            elif self.has_deepseek_fp8_block_scales:
+                return self.run_moe_fp8_block_scales(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    enable_alltoall=enable_alltoall)
+            else:
+                raise ValueError(
+                    f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
+                )
 
     def forward_chunk(
             self,

@@ -28,6 +28,8 @@ import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from .base import Communication
 
@@ -155,16 +157,28 @@ class NVLinkTwoSided(Communication):
         original_token_count = hidden_states.shape[0]  # Store for combine
         top_k = token_selected_slots.shape[1]
 
-        # Dispatch quantized data using AllToAll
-        hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
-            MnnvlMoe.mnnvl_moe_alltoallv(
-                [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales],
-                alltoall_info,
-                self.alltoall_workspace,
-                self.ep_rank,
-                self.ep_size,
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_tensors = [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales]
+        _payload_bytes = sum(t.numel() * t.element_size() for t in _payload_tensors if t is not None)
+        with _tracer.time_a2a(
+            op_type="dispatch",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_two_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            # Dispatch quantized data using AllToAll
+            hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
+                MnnvlMoe.mnnvl_moe_alltoallv(
+                    [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales],
+                    alltoall_info,
+                    self.alltoall_workspace,
+                    self.ep_rank,
+                    self.ep_size,
+                )
             )
-        )
 
         # Set expert IDs after alltoall
         torch.ops.trtllm.memset_expert_ids(
@@ -192,16 +206,27 @@ class NVLinkTwoSided(Communication):
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
 
-        final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-            final_hidden_states,
-            self._dispatch_state["alltoall_info"],
-            self.alltoall_workspace,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            top_k=self.top_k,
-            token_count=self._dispatch_state["original_token_count"],
-            use_low_precision_combine=self.use_low_precision_combine,
-            do_reduce=self.alltoall_result_do_sum,
-        )
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_bytes = final_hidden_states.numel() * final_hidden_states.element_size()
+        with _tracer.time_a2a(
+            op_type="combine",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_two_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                final_hidden_states,
+                self._dispatch_state["alltoall_info"],
+                self.alltoall_workspace,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=self.top_k,
+                token_count=self._dispatch_state["original_token_count"],
+                use_low_precision_combine=self.use_low_precision_combine,
+                do_reduce=self.alltoall_result_do_sum,
+            )
 
         return final_hidden_states

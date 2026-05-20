@@ -29,6 +29,8 @@ from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, dee
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from .base import Communication
 
@@ -145,75 +147,88 @@ class DeepEP(Communication):
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
 
-        if not self.supports_post_quant_dispatch():
-            # Pre-quant dispatch (unquantized data)
-            (
-                hidden_states,
-                recv_topk_idx,
-                token_final_scales,
-                num_recv_tokens_per_expert_list,
-                deep_ep_handle,
-            ) = self.deep_ep_buffer.dispatch(
-                hidden_states,
-                token_selected_slots,
-                token_final_scales,
-                self.num_slots,
-                self.expert_size_per_partition * self.ep_rank,
-                all_rank_max_num_tokens,
-                self.ep_size,
-                self.use_cuda_graph,
-            )
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_tensors = [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales]
+        _payload_bytes = sum(t.numel() * t.element_size() for t in _payload_tensors if t is not None)
+        with _tracer.time_a2a(
+            op_type="dispatch",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="deepep",
+        ) as _span:
+            _span.to_rank = self.ep_size
 
-            padded, hidden_states, _, token_selected_slots, token_final_scales = (
-                self._pad_empty_recv_tensors(hidden_states, None, recv_topk_idx, token_final_scales)
-            )
-
-            # Store dispatch state for combine
-            self._dispatch_state = {
-                "deep_ep_handle": deep_ep_handle,
-                "padded": padded,
-            }
-
-        else:
-            # Post-quant dispatch (quantized data, nvfp4 only)
-
-            if hidden_states_sf is not None:
-                # Adapter between `hidden_states_sf` and DeepEP
-                # TODO: remove the adapter by adding dtype support to DeepEP
-                sf_dtype = hidden_states_sf.dtype
-                hidden_states_sf = hidden_states_sf.view(torch.float32)
-
-            (
-                (hidden_states, hidden_states_sf),
-                recv_topk_idx,
-                token_final_scales,
-                num_recv_tokens_per_expert_list,
-                deep_ep_handle,
-            ) = self.deep_ep_buffer.dispatch(
-                (hidden_states, hidden_states_sf),
-                token_selected_slots,
-                token_final_scales,
-                self.num_slots,
-                self.expert_size_per_partition * self.ep_rank,
-                all_rank_max_num_tokens,
-                self.ep_size,
-                self.use_cuda_graph,
-            )
-
-            padded, hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
-                self._pad_empty_recv_tensors(
-                    hidden_states, hidden_states_sf, recv_topk_idx, token_final_scales
+            if not self.supports_post_quant_dispatch():
+                # Pre-quant dispatch (unquantized data)
+                (
+                    hidden_states,
+                    recv_topk_idx,
+                    token_final_scales,
+                    num_recv_tokens_per_expert_list,
+                    deep_ep_handle,
+                ) = self.deep_ep_buffer.dispatch(
+                    hidden_states,
+                    token_selected_slots,
+                    token_final_scales,
+                    self.num_slots,
+                    self.expert_size_per_partition * self.ep_rank,
+                    all_rank_max_num_tokens,
+                    self.ep_size,
+                    self.use_cuda_graph,
                 )
-            )
 
-            if hidden_states_sf is not None:
-                hidden_states_sf = hidden_states_sf.view(sf_dtype)
+                padded, hidden_states, _, token_selected_slots, token_final_scales = (
+                    self._pad_empty_recv_tensors(hidden_states, None, recv_topk_idx, token_final_scales)
+                )
 
-            # Store dispatch state for combine
-            self._dispatch_state = {
-                "deep_ep_handle": deep_ep_handle,
-                "padded": padded,
-            }
+                # Store dispatch state for combine
+                self._dispatch_state = {
+                    "deep_ep_handle": deep_ep_handle,
+                    "padded": padded,
+                }
+
+            else:
+                # Post-quant dispatch (quantized data, nvfp4 only)
+
+                if hidden_states_sf is not None:
+                    # Adapter between `hidden_states_sf` and DeepEP
+                    # TODO: remove the adapter by adding dtype support to DeepEP
+                    sf_dtype = hidden_states_sf.dtype
+                    hidden_states_sf = hidden_states_sf.view(torch.float32)
+
+                (
+                    (hidden_states, hidden_states_sf),
+                    recv_topk_idx,
+                    token_final_scales,
+                    num_recv_tokens_per_expert_list,
+                    deep_ep_handle,
+                ) = self.deep_ep_buffer.dispatch(
+                    (hidden_states, hidden_states_sf),
+                    token_selected_slots,
+                    token_final_scales,
+                    self.num_slots,
+                    self.expert_size_per_partition * self.ep_rank,
+                    all_rank_max_num_tokens,
+                    self.ep_size,
+                    self.use_cuda_graph,
+                )
+
+                padded, hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
+                    self._pad_empty_recv_tensors(
+                        hidden_states, hidden_states_sf, recv_topk_idx, token_final_scales
+                    )
+                )
+
+                if hidden_states_sf is not None:
+                    hidden_states_sf = hidden_states_sf.view(sf_dtype)
+
+                # Store dispatch state for combine
+                self._dispatch_state = {
+                    "deep_ep_handle": deep_ep_handle,
+                    "padded": padded,
+                }
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 
@@ -229,7 +244,19 @@ class DeepEP(Communication):
         padded = self._dispatch_state["padded"]
 
         final_hidden_states = self._unpad_tensors(padded, final_hidden_states)
-        final_hidden_states = self.deep_ep_buffer.combine(final_hidden_states, deep_ep_handle)
+
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_bytes = final_hidden_states.numel() * final_hidden_states.element_size()
+        with _tracer.time_a2a(
+            op_type="combine",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="deepep",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            final_hidden_states = self.deep_ep_buffer.combine(final_hidden_states, deep_ep_handle)
 
         return final_hidden_states
 

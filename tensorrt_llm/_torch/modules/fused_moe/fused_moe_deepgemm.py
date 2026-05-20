@@ -23,6 +23,8 @@ import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
@@ -627,6 +629,33 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         assert token_selected_experts is not None
         assert token_final_scales is not None
 
+        _tracer = get_moe_trace_logger()
+        _compute_cm = _tracer.time_moe_compute(
+            kernel="deepgemm_run_moe",
+            layer=self.layer_idx if self.layer_idx is not None else -1,
+            phase=current_phase(),
+            extra={
+                "num_tokens": int(x.shape[0]) if hasattr(x, "shape") else -1,
+                "num_experts": int(self.num_slots),
+                "backend": "deepgemm",
+            },
+        )
+        _compute_cm.__enter__()
+        try:
+            return self._run_moe_inner(
+                x, token_selected_experts, token_final_scales, x_sf, workspace
+            )
+        finally:
+            _compute_cm.__exit__(None, None, None)
+
+    def _run_moe_inner(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        workspace: dict = None,
+    ) -> torch.Tensor:
         # Permutation
         (
             permuted_row_to_unpermuted_row_tensor,

@@ -28,6 +28,8 @@ import torch
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from .base import Communication
 
@@ -143,120 +145,133 @@ class DeepEPLowLatency(Communication):
         deep_ep_topk_idx = token_selected_slots
         deep_ep_topk_weights = token_final_scales
 
-        if not self.supports_post_quant_dispatch():
-            # Pre-quant dispatch (unquantized data)
-            hidden_states, recv_expert_count, deep_ep_handle = (
-                self.deep_ep_buffer.low_latency_dispatch(
-                    hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
-                )
-            )
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_tensors = [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales]
+        _payload_bytes = sum(t.numel() * t.element_size() for t in _payload_tensors if t is not None)
+        with _tracer.time_a2a(
+            op_type="dispatch",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="deepep_ll",
+        ) as _span:
+            _span.to_rank = self.ep_size
 
-            hidden_states, _, token_selected_slots, token_final_scales = (
-                self._modify_output_to_adapt_fused_moe(
-                    hidden_states, None, recv_expert_count, token_final_scales.dtype
-                )
-            )
-
-            # Store dispatch state for combine
-            self._dispatch_state = {
-                "deep_ep_handle": deep_ep_handle,
-                "deep_ep_topk_idx": deep_ep_topk_idx,
-                "deep_ep_topk_weights": deep_ep_topk_weights,
-                "recv_expert_count": recv_expert_count,
-            }
-
-        else:
-            # Post-quant dispatch (quantized data)
-            if self._has_fp8_qdq():
-                assert hidden_states.dtype == torch.float8_e4m3fn and hidden_states_sf is None, (
-                    "hidden_states should be torch.float8_e4m3fn and hidden_states_sf should be None "
-                    "in fp8 postquant alltoall"
-                )
-
-                hidden_states = hidden_states.view(torch.bfloat16)
+            if not self.supports_post_quant_dispatch():
+                # Pre-quant dispatch (unquantized data)
                 hidden_states, recv_expert_count, deep_ep_handle = (
                     self.deep_ep_buffer.low_latency_dispatch(
                         hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
                     )
                 )
-                hidden_states = hidden_states.view(torch.float8_e4m3fn)
 
-            elif self._has_nvfp4():
-                token_num = hidden_states.shape[0]
-                # For nvfp4, hidden_states.shape[1] is the quantized dimension (hidden_size // 2)
-                # We need to calculate the original hidden_size
-                # note: we use uint8 to store 2 fp4 values
-                hidden_size = hidden_states.shape[1] * 2
-
-                # Pre-dispatch assertions
-                assert (
-                    hidden_states.dtype == torch.uint8
-                    and hidden_states_sf is not None
-                    and hidden_states_sf.dtype == torch.uint8
-                )
-                assert hidden_size % 32 == 0, (
-                    "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
-                )
-                assert (
-                    hidden_states_sf.shape[0] == token_num
-                    and hidden_states_sf.shape[1] == hidden_size // 16
-                )
-                assert (
-                    hidden_states.shape[0] == token_num
-                    and hidden_states.shape[1] == hidden_size // 2
-                )
-
-                hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
-                    self.deep_ep_buffer.low_latency_dispatch_fp4(
-                        hidden_states,
-                        hidden_states_sf,
-                        deep_ep_topk_idx,
-                        all_rank_max_num_tokens,
-                        self.num_slots,
+                hidden_states, _, token_selected_slots, token_final_scales = (
+                    self._modify_output_to_adapt_fused_moe(
+                        hidden_states, None, recv_expert_count, token_final_scales.dtype
                     )
                 )
 
-                # Post-dispatch assertions
-                assert hidden_states.dtype == torch.uint8 and hidden_states_sf.dtype == torch.uint8
-                assert hidden_states.dim() == 3 and hidden_states_sf.dim() == 3
-                assert (
-                    hidden_states.shape[2] == hidden_size // 2
-                    and hidden_states_sf.shape[2] == hidden_size // 16
-                )
-
-            elif self._has_w4afp8():
-                assert pre_quant_scale is not None, "W4AFP8 requires pre_quant_scale"
-                assert (
-                    pre_quant_scale.shape == (1, hidden_states.shape[1])
-                    and pre_quant_scale.dtype == hidden_states.dtype
-                )
-
-                hidden_states = (
-                    (hidden_states * pre_quant_scale).to(torch.float8_e4m3fn).view(torch.bfloat16)
-                )
-                hidden_states, recv_expert_count, deep_ep_handle = (
-                    self.deep_ep_buffer.low_latency_dispatch(
-                        hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
-                    )
-                )
-                hidden_states = hidden_states.view(torch.float8_e4m3fn)
+                # Store dispatch state for combine
+                self._dispatch_state = {
+                    "deep_ep_handle": deep_ep_handle,
+                    "deep_ep_topk_idx": deep_ep_topk_idx,
+                    "deep_ep_topk_weights": deep_ep_topk_weights,
+                    "recv_expert_count": recv_expert_count,
+                }
 
             else:
-                raise ValueError("Unsupported quantization mode for post-quant DeepEPLowLatency")
+                # Post-quant dispatch (quantized data)
+                if self._has_fp8_qdq():
+                    assert hidden_states.dtype == torch.float8_e4m3fn and hidden_states_sf is None, (
+                        "hidden_states should be torch.float8_e4m3fn and hidden_states_sf should be None "
+                        "in fp8 postquant alltoall"
+                    )
 
-            hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
-                self._modify_output_to_adapt_fused_moe(
-                    hidden_states, hidden_states_sf, recv_expert_count, token_final_scales.dtype
+                    hidden_states = hidden_states.view(torch.bfloat16)
+                    hidden_states, recv_expert_count, deep_ep_handle = (
+                        self.deep_ep_buffer.low_latency_dispatch(
+                            hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
+                        )
+                    )
+                    hidden_states = hidden_states.view(torch.float8_e4m3fn)
+
+                elif self._has_nvfp4():
+                    token_num = hidden_states.shape[0]
+                    # For nvfp4, hidden_states.shape[1] is the quantized dimension (hidden_size // 2)
+                    # We need to calculate the original hidden_size
+                    # note: we use uint8 to store 2 fp4 values
+                    hidden_size = hidden_states.shape[1] * 2
+
+                    # Pre-dispatch assertions
+                    assert (
+                        hidden_states.dtype == torch.uint8
+                        and hidden_states_sf is not None
+                        and hidden_states_sf.dtype == torch.uint8
+                    )
+                    assert hidden_size % 32 == 0, (
+                        "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
+                    )
+                    assert (
+                        hidden_states_sf.shape[0] == token_num
+                        and hidden_states_sf.shape[1] == hidden_size // 16
+                    )
+                    assert (
+                        hidden_states.shape[0] == token_num
+                        and hidden_states.shape[1] == hidden_size // 2
+                    )
+
+                    hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
+                        self.deep_ep_buffer.low_latency_dispatch_fp4(
+                            hidden_states,
+                            hidden_states_sf,
+                            deep_ep_topk_idx,
+                            all_rank_max_num_tokens,
+                            self.num_slots,
+                        )
+                    )
+
+                    # Post-dispatch assertions
+                    assert hidden_states.dtype == torch.uint8 and hidden_states_sf.dtype == torch.uint8
+                    assert hidden_states.dim() == 3 and hidden_states_sf.dim() == 3
+                    assert (
+                        hidden_states.shape[2] == hidden_size // 2
+                        and hidden_states_sf.shape[2] == hidden_size // 16
+                    )
+
+                elif self._has_w4afp8():
+                    assert pre_quant_scale is not None, "W4AFP8 requires pre_quant_scale"
+                    assert (
+                        pre_quant_scale.shape == (1, hidden_states.shape[1])
+                        and pre_quant_scale.dtype == hidden_states.dtype
+                    )
+
+                    hidden_states = (
+                        (hidden_states * pre_quant_scale).to(torch.float8_e4m3fn).view(torch.bfloat16)
+                    )
+                    hidden_states, recv_expert_count, deep_ep_handle = (
+                        self.deep_ep_buffer.low_latency_dispatch(
+                            hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
+                        )
+                    )
+                    hidden_states = hidden_states.view(torch.float8_e4m3fn)
+
+                else:
+                    raise ValueError("Unsupported quantization mode for post-quant DeepEPLowLatency")
+
+                hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
+                    self._modify_output_to_adapt_fused_moe(
+                        hidden_states, hidden_states_sf, recv_expert_count, token_final_scales.dtype
+                    )
                 )
-            )
 
-            # Store dispatch state for combine
-            self._dispatch_state = {
-                "deep_ep_handle": deep_ep_handle,
-                "deep_ep_topk_idx": deep_ep_topk_idx,
-                "deep_ep_topk_weights": deep_ep_topk_weights,
-                "recv_expert_count": recv_expert_count,
-            }
+                # Store dispatch state for combine
+                self._dispatch_state = {
+                    "deep_ep_handle": deep_ep_handle,
+                    "deep_ep_topk_idx": deep_ep_topk_idx,
+                    "deep_ep_topk_weights": deep_ep_topk_weights,
+                    "recv_expert_count": recv_expert_count,
+                }
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 
@@ -287,28 +302,39 @@ class DeepEPLowLatency(Communication):
             # Deep ep low latency combine requires for fp32 weights
             deep_ep_topk_weights = deep_ep_topk_weights.to(torch.float32)
 
-        if self.use_low_precision_combine:
-            if self._has_nvfp4():
-                precision = "nvfp4"
-                global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
-                    final_hidden_states, recv_expert_count
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_bytes = final_hidden_states.numel() * final_hidden_states.element_size()
+        with _tracer.time_a2a(
+            op_type="combine",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="deepep_ll",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            if self.use_low_precision_combine:
+                if self._has_nvfp4():
+                    precision = "nvfp4"
+                    global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                        final_hidden_states, recv_expert_count
+                    )
+                else:
+                    precision = "fp8"
+                    global_scales = None
+
+                final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
+                    precision,
+                    final_hidden_states,
+                    global_scales,
+                    deep_ep_topk_idx,
+                    deep_ep_topk_weights,
+                    deep_ep_handle,
                 )
             else:
-                precision = "fp8"
-                global_scales = None
-
-            final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
-                precision,
-                final_hidden_states,
-                global_scales,
-                deep_ep_topk_idx,
-                deep_ep_topk_weights,
-                deep_ep_handle,
-            )
-        else:
-            final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights, deep_ep_handle
-            )
+                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                    final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights, deep_ep_handle
+                )
 
         return final_hidden_states
 

@@ -34,6 +34,8 @@ from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.moe_trace_logger import get_moe_trace_logger
+from tensorrt_llm.moe_trace_logger_phase import current_phase
 
 from .base import Communication
 
@@ -345,20 +347,31 @@ class NVLinkOneSided(Communication):
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
 
-        recv_buffers, combine_payload_offset, eplb_gathered_stats = (
-            torch.ops.trtllm.moe_a2a_dispatch(
-                token_selected_slots,
-                payloads,
-                self.workspace,
-                self.moe_a2a_metainfo,
-                runtime_max_tokens_per_rank,
-                self.ep_rank,
-                self.ep_size,
-                self.top_k,
-                self.num_experts,
-                eplb_local_stats,
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_bytes = sum(p.numel() * p.element_size() for p in payloads if p is not None)
+        with _tracer.time_a2a(
+            op_type="dispatch",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_one_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            recv_buffers, combine_payload_offset, eplb_gathered_stats = (
+                torch.ops.trtllm.moe_a2a_dispatch(
+                    token_selected_slots,
+                    payloads,
+                    self.workspace,
+                    self.moe_a2a_metainfo,
+                    runtime_max_tokens_per_rank,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.top_k,
+                    self.num_experts,
+                    eplb_local_stats,
+                )
             )
-        )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -461,18 +474,29 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
-        output = torch.ops.trtllm.moe_a2a_combine(
-            final_hidden_states,
-            int(local_num_tokens),
-            self.workspace,
-            self.moe_a2a_metainfo,
-            int(runtime_max_tokens_per_rank),
-            self.ep_rank,
-            self.ep_size,
-            self.top_k,
-            int(combine_payload_offset),
-            bool(self.payload_in_workspace),
-        )
+        _tracer = get_moe_trace_logger()
+        _layer_idx = kwargs.get("layer_idx", -1)
+        _payload_bytes = final_hidden_states.numel() * final_hidden_states.element_size()
+        with _tracer.time_a2a(
+            op_type="combine",
+            layer=_layer_idx,
+            phase=current_phase(),
+            payload_bytes=_payload_bytes,
+            backend="nvlink_one_sided",
+        ) as _span:
+            _span.to_rank = self.ep_size
+            output = torch.ops.trtllm.moe_a2a_combine(
+                final_hidden_states,
+                int(local_num_tokens),
+                self.workspace,
+                self.moe_a2a_metainfo,
+                int(runtime_max_tokens_per_rank),
+                self.ep_rank,
+                self.ep_size,
+                self.top_k,
+                int(combine_payload_offset),
+                bool(self.payload_in_workspace),
+            )
 
         # Reset state for next round
         self._dispatch_state = {"phase": "idle"}
