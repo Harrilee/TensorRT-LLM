@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# MoE trace image for TensorRT-LLM PyTorch backend.
+#
+# Multi-arch: linux/amd64, linux/arm64. Build with:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f docker/Dockerfile.moe-trace -t <registry>/trtllm-moe-trace:<tag> --push .
+#
+# Base is NGC PyTorch 25.12, which ships torch 2.10.0a0 with the exact ABI
+# the TRT-LLM wheel was built against, so the wheel installs cleanly without
+# a source rebuild. Only the instrumented Python files are overlaid onto the
+# wheel install -- the wheel's compiled .so artifacts are reused as-is.
+
+ARG TRTLLM_VERSION=1.3.0rc5.post2
+FROM nvcr.io/nvidia/pytorch:25.12-py3
+
+ARG TRTLLM_VERSION
+
+RUN pip install --no-cache-dir \
+      "tensorrt-llm==${TRTLLM_VERSION}" \
+      nvidia-cublas \
+      aiperf \
+      --extra-index-url https://pypi.nvidia.com
+
+# Stage the instrumented source so the overlay step can pick out the .py files
+# it needs. Anything not listed in the loop below is discarded.
+COPY tensorrt_llm /opt/trtllm-src/tensorrt_llm
+
+# Overlay the instrumented Python onto the wheel install. Keep this list in
+# sync with the MODIFIED_FILES list in moe_trace.sh.
+RUN SP=$(python -c "import tensorrt_llm, os; print(os.path.dirname(tensorrt_llm.__file__))") && \
+    for f in \
+      moe_trace_logger.py \
+      moe_trace_logger_phase.py \
+      _torch/modules/fused_moe/communication/deep_ep.py \
+      _torch/modules/fused_moe/communication/deep_ep_low_latency.py \
+      _torch/modules/fused_moe/communication/nvlink_one_sided.py \
+      _torch/modules/fused_moe/communication/nvlink_two_sided.py \
+      _torch/modules/fused_moe/fused_moe_cute_dsl.py \
+      _torch/modules/fused_moe/fused_moe_cutlass.py \
+      _torch/modules/fused_moe/fused_moe_deepgemm.py \
+      _torch/modules/fused_moe/fused_moe_trtllm_gen.py \
+      _torch/modules/fused_moe/fused_moe_wide_ep.py ; do \
+      install -D -m 644 "/opt/trtllm-src/tensorrt_llm/${f}" "${SP}/${f}" ; \
+    done && \
+    rm -rf /opt/trtllm-src
+
+COPY docker/moe-trace-entrypoint.sh /usr/local/bin/moe-trace
+RUN chmod +x /usr/local/bin/moe-trace
+
+ENV MOE_TRACE_ENABLE=1 \
+    MOE_TRACE_DIR=/traces \
+    MOE_TRACE_FLUSH_EVERY=512 \
+    MODEL=Qwen/Qwen3.5-397B-A17B \
+    TP=4 \
+    PORT=30000
+
+VOLUME ["/traces"]
+EXPOSE 30000
+
+ENTRYPOINT ["/usr/local/bin/moe-trace"]
